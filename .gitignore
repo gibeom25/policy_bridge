@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+fault_dumps/
+camera_preview/
+timerlat_trace.txt
+.control_cpu
+*.bak*
