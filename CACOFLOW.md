@@ -64,3 +64,24 @@ delta가 매 step마다 **그 순간 측정한 관절값** 기준이라서 `robo
   (`--max-steps 60`) 시험한다.
 - Robot Server는 이미지 촬영 시각을 보내지 않는다. 그래서 수신 시각을 촬영 시각으로 쓰고, 실제 관측은 그보다 조금 오래됐다.
 - 실패(연결 끊김, 오래된 관측 등) 후에는 세션이 무효가 된다. 새 시행으로 다시 시작하고, 서버 쪽 시행 기록 정리는 협업자와 맞춘다.
+
+## GUI (`cacoflow_gui.py`)
+
+franka-deploy와 같은 방식의 웹 대시보드(FastAPI + 바닐라 JS, `gui_static/`)로 위 흐름 전체를 브라우저에서 실행한다.
+`cacoflow_bridge.py`/`cacoflow_client.py`는 수정 없이 그대로 쓴다.
+
+```bash
+~/venvs/policy_bridge/bin/pip install -r requirements-gui.txt   # fastapi, uvicorn
+./run_cacoflow_gui.sh                                            # http://127.0.0.1:8080/ (이 PC에서만 접속 가능)
+```
+
+- **자동 시작**: 실행 시 Robot Server가 꺼져 있으면 sudo 비밀번호를 한 번 묻고(`setup_rt.sh`용), GUI가
+  `run_server.sh`(RT 튜닝 → 카메라 리셋 → 서버)를 컨트롤러 설정과 함께 시작한다. GUI 프로세스는 제어 CPU를 피해 고정된다.
+- **컨트롤러 설정**(설정 탭): 관절 임피던스 ×7, v-max, a-max, j-max, filter-wn. 서버를 (재)시작할 때 `run_server.sh`를 통해
+  `robot_server.py`에 전달된다. 기본값은 서버 기본값 = 수집기 `JOINT_STIFFNESS`와 같다. 값이 바뀌면 "서버 중지 → 로봇 준비"로 다시 적용한다.
+- **배포 탭**: 로봇 준비(서버 시작 + 연결, 카메라 미리보기) → CaCoFlow 서버 연결(`/info` 표시) → 작업·그리퍼 의미·trial 설정 후 시작 →
+  진행(step, chunk, 왕복 지연) → 결과 입력(`/end_trial`). 그리퍼 1의 의미는 기본값 없이 반드시 선택해야 하고,
+  시작마다 "비상 정지 버튼이 손 닿는 곳에 있음"을 체크해야 한다. 기본 최대 step은 60.
+- **주의**: 로봇에 연결하는 순간 Robot Server의 1 kHz 컨트롤러가 켜진다. **정지** 버튼은 현재 위치 유지 + 시행 종료이며,
+  추론 응답 대기 중에는 응답 후 반영된다. 실제 안전장치는 물리 비상 정지다.
+- API 토큰과 SSH 비밀번호는 메모리에만 두고 파일에 저장하지 않는다. 그 외 설정은 `~/.config/policy_bridge/gui_config.json`.

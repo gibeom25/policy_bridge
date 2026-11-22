@@ -55,5 +55,5 @@ python -u reset_cameras.py 2>&1 | tee -a server.log
 
 # ---- 4. start --------------------------------------------------------------------------------------------
 log "starting robot_server.py $(date '+%F %T'): control process on CPU $CONTROL_CPU, everything else on $OTHER_CPUS"
-taskset -c "$OTHER_CPUS" python -u robot_server.py --ip "$ROBOT_IP" --port 8000 --control-cpu "$CONTROL_CPU" \
-  2>&1 | tee -a server.log
+taskset -c "$OTHER_CPUS" python -u robot_server.py --ip "$ROBOT_IP" --port 8000 --control-cpu "$CONTROL_CPU" "$@" \
+  2>&1 | tee -a server.log      # extra args (e.g. --v-max 0.4, --joint-impedance ...) go straight to robot_server.py
