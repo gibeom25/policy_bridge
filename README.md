@@ -30,17 +30,4 @@ sudo apt install ethtool linux-tools-$(uname -r)    # setup_rt.sh / rt_check.sh 
 
 환경 변수: `ROBOT_IP`(기본 172.16.0.2), `CONTROL_CPU`(제어 CPU 고정), `FRANKA_VENV`, `CLIENT_VENV`, `FR3_BRIDGE_DIR`.
 
-## 실시간 설정 (`setup_rt.sh`, root)
-
-1 kHz FCI 링크는 PC가 수 ms만 멈춰도 `joint_motion_generator_*_discontinuity` 반사로 정지한다. 노트북(HP 245 G8)에서
-실측으로 찾은 원인과 대응:
-
-| 원인 (측정 방법) | 대응 |
-|---|---|
-| CPU 깊은 idle 상태 복귀 ~3 ms (`rtla timerlat`) | latency > 1 µs인 cpuidle 상태 비활성화 |
-| Realtek Wi-Fi(rtw89) PCIe 레지스터 읽기 2.9 ms 정지 (`rtla timerlat` 스택) | rtw89 ASPM/CLKREQ/절전 끔 (`/etc/modprobe.d/rtw89-realtime.conf`) |
-| 로봇 NIC 수신 softirq가 일반 우선순위 (반사 직전 기록) | NIC IRQ 전부 한 CPU로, 그 CPU의 ksoftirqd/IRQ 스레드 FIFO 90, 제어 프로세스도 그 CPU에 단독 고정 |
-| NIC 절전 | EEE, flow control, PCIe ASPM 끔 |
-
-점검: `sudo ./rt_check.sh` (60초, 1 ms 넘는 지연이 생기면 원인 스택 출력 → `rtla.log`).
-Franka는 Intel 유선 랜카드를 권장한다. Realtek 유선(r8169)에서는 위 설정 후에도 명령이 연속 유실된 사례가 있다.
+Action chunk 실행 방식(async/sync), 옵션, 로그 보는 법: [USAGE.md](USAGE.md)
