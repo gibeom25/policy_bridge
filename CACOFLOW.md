@@ -85,3 +85,21 @@ franka-deploy와 같은 방식의 웹 대시보드(FastAPI + 바닐라 JS, `gui_
 - **주의**: 로봇에 연결하는 순간 Robot Server의 1 kHz 컨트롤러가 켜진다. **정지** 버튼은 현재 위치 유지 + 시행 종료이며,
   추론 응답 대기 중에는 응답 후 반영된다. 실제 안전장치는 물리 비상 정지다.
 - API 토큰과 SSH 비밀번호는 메모리에만 두고 파일에 저장하지 않는다. 그 외 설정은 `~/.config/policy_bridge/gui_config.json`.
+
+### GUI: 방식 선택, 녹화, 기록
+
+- **기본값**: SSH 포트 3921, agent zoom 1.2, 최대 step 60, 시행 중 자동 녹화 켜짐. 설정 탭에서 바꾸면
+  `~/.config/policy_bridge/gui_config.json`에 저장된다.
+- **방식(method)**: 설정 탭의 방식 프로필(이름 + 원격 정책 포트)로 `cacoflow`, `cacoflow+state` 같은 정책 서버를 등록하고,
+  배포 탭에서 방식을 고른 뒤 "서버 연결 / 확인"을 누른다. **`cacoflow+state`의 원격 포트(8001)는 확인되지 않은 값이다.**
+  방식마다 다른 터널로 연결되고, 시행 기록에 방식 이름과 `/info`의 `model_id`가 함께 남는다.
+  이 GUI는 CaCoFlow 프로토콜(HTTP + 토큰)만 지원한다. 방식이 `robot_client2.py` 프로토콜이면 `run_client.sh`로 실행한다.
+- **instruction**: 서버 `/info`의 작업 목록에서 고르거나 "직접 입력"에 쓴다(입력이 우선). 목록에 없는 문장은 경고가 뜨고,
+  서버가 거부하면 시행이 오류로 끝난다.
+- **전체 view 녹화**: 로봇 준비 후 agent 카메라의 **전체 view**(policy 입력용 zoom 이전 원본)를 mp4로 녹화한다.
+  "녹화 시작/중지"로 시행과 별도로 할 수 있고, "시행 중 자동 녹화"를 켜면 시행 시작/종료에 맞춰 자동으로 녹화한다.
+- **성공 여부**: 시행이 끝나면 성공 / 실패 / 미결정 버튼으로 기록한다. 서버(`/end_trial`)와 로컬 `trials.csv`에 함께 남고,
+  서버 전송이 실패해도 로컬 기록은 저장된다. 배포 탭 아래에 최근 기록과 방식별 성공률이 표시된다.
+- **저장 위치**: `~/policy_bridge_data/` (`POLICY_BRIDGE_DATA`로 변경). `trials.csv`(방식, model_id, trial id, instruction,
+  placement, 성공 여부, 메모, 영상 경로 등)와 `videos/`.
+- 녹화에는 `imageio`, `imageio-ffmpeg`가 필요하다(`requirements-gui.txt`).

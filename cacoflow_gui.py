@@ -2,20 +2,24 @@
 """Web dashboard for CaCoFlow trials (see CACOFLOW.md, "GUI").
 
 Wraps cacoflow_bridge.py / cacoflow_client.py (unchanged): Robot Server start/stop with the controller
-parameters, robot connection + camera preview, CaCoFlow server connection (SSH tunnel), trial start/stop
-and the operator's outcome report. Run it with ./run_cacoflow_gui.sh (binds 127.0.0.1 only).
+parameters, robot connection + camera preview, CaCoFlow server connection (SSH tunnel, one profile per method),
+trial start/stop, full-view video recording, and the operator's outcome report (also written to a local CSV).
+Run it with ./run_cacoflow_gui.sh (binds 127.0.0.1 only).
 
 Safety notes:
   * Connecting to the Robot Server starts its 1 kHz controller (the arm is then held under impedance control).
   * Stop = hold the current position and end the trial. The physical e-stop is the real safety device.
   * The CaCoFlow token and SSH password live in this process's memory only (never written to disk).
+Data (videos, trials.csv) goes to ~/policy_bridge_data (override: POLICY_BRIDGE_DATA).
 """
 from __future__ import annotations
 
+import csv
 import io
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -34,32 +38,47 @@ from pydantic import BaseModel, Field
 
 from cacoflow_bridge import WsRobot
 from cacoflow_client import InferenceClient, run_trial
-from robot_client2 import SSHTunnel
+from robot_client2 import SSHTunnel, decode_rgb8_image, zoom_crop
 
 logger = logging.getLogger("cacoflow_gui")
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "gui_static"
 CONFIG_PATH = Path.home() / ".config" / "policy_bridge" / "gui_config.json"
+DATA_DIR = Path(os.environ.get("POLICY_BRIDGE_DATA", Path.home() / "policy_bridge_data"))
+VIDEO_DIR = DATA_DIR / "videos"
+TRIAL_LOG = DATA_DIR / "trials.csv"
 SERVER_LOG = HERE / "server.log"
 ROBOT_HOST, ROBOT_PORT = "127.0.0.1", 8000
+RECORD_FPS = 15                                        # the Robot Server streams images at 15 Hz
 
 # Same values as robot_server.py's defaults (and the data collector's JOINT_STIFFNESS).
 DEFAULT_IMPEDANCE = [3000.0, 3000.0, 3000.0, 2500.0, 2500.0, 2000.0, 2000.0]
 
 
 # ------------------------------------------------------------------------------------------ config
+class Method(BaseModel):
+    """One policy server profile (e.g. "cacoflow", "cacoflow+state"): same protocol, different endpoint."""
+    name: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_+.\- ]+$")
+    remote_policy_port: int = Field(8000, ge=1, le=65535)
+    policy_url: str = Field("", max_length=300)         # "direct URL" mode only; empty = Config.policy_url
+
+
 class Config(BaseModel):
     robot_url: str = Field("ws://127.0.0.1:8000", pattern=r"^ws://(127\.0\.0\.1|localhost)(:\d+)?$")
     policy_mode: Literal["ssh", "url"] = "ssh"
     ssh_host: str = Field("155.230.12.123", max_length=253)
-    ssh_port: int = Field(22, ge=1, le=65535)
+    ssh_port: int = Field(3921, ge=1, le=65535)
     ssh_user: str = Field("tanvir", max_length=64)
     ssh_key: str = Field("", max_length=500)
-    remote_policy_port: int = Field(8000, ge=1, le=65535)
     policy_url: str = Field("http://127.0.0.1:8100", max_length=300)
-    agent_zoom: float = Field(1.0, ge=1.0, le=3.0)
+    methods: list[Method] = Field(default_factory=lambda: [
+        Method(name="cacoflow", remote_policy_port=8000),
+        Method(name="cacoflow+state", remote_policy_port=8001),   # port NOT confirmed: edit in Settings
+    ], min_length=1, max_length=6)
+    agent_zoom: float = Field(1.2, ge=1.0, le=3.0)
     timeout: float = Field(5.0, gt=0, le=60)
     max_observation_age: float = Field(0.5, gt=0, le=5)
+    auto_record: bool = True
     # Robot Server controller (applied when the server is (re)started)
     joint_impedance: list[float] = Field(default_factory=lambda: list(DEFAULT_IMPEDANCE), min_length=7, max_length=7)
     v_max: float = Field(0.8, gt=0, le=1.5)
@@ -75,10 +94,21 @@ class Config(BaseModel):
     def controller_key(self) -> list:
         return [*self.joint_impedance, self.v_max, self.a_max, self.j_max, self.filter_wn]
 
+    def method(self, name: Optional[str]) -> Method:
+        for m in self.methods:
+            if m.name == name:
+                return m
+        if name:
+            raise HTTPException(400, f"unknown method {name!r}")
+        return self.methods[0]
 
-def validate_impedance(cfg: Config) -> None:
+
+def validate_config(cfg: Config) -> None:
     if any(not (0 < k <= 4000) for k in cfg.joint_impedance):
         raise HTTPException(400, "joint impedance must be in (0, 4000] Nm/rad")
+    names = [m.name for m in cfg.methods]
+    if len(set(names)) != len(names):
+        raise HTTPException(400, "method names must be unique")
 
 
 def load_config() -> Config:
@@ -93,6 +123,54 @@ def save_config(cfg: Config) -> None:
     tmp = CONFIG_PATH.with_suffix(".tmp")
     tmp.write_text(cfg.model_dump_json(indent=2))
     os.replace(tmp, CONFIG_PATH)
+
+
+# ---------------------------------------------------------------------------------- trial log (CSV)
+LOG_FIELDS = ["time", "method", "model_id", "trial_id", "instruction", "in_server_tasks", "placement", "appearance",
+              "max_steps", "steps", "chunks", "clipped_steps", "rt_median_ms", "stopped", "success", "wrong_object",
+              "notes", "status", "error", "video", "server_trial_dir", "agent_zoom", "gripper_one_means"]
+_log_lock = threading.Lock()
+
+
+def _cell(v):
+    """CSV cell; neutralise spreadsheet formulas in free text."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+        return "'" + v
+    return "" if v is None else v
+
+
+def log_trial(row: dict) -> None:
+    with _log_lock:
+        TRIAL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        new = not TRIAL_LOG.exists()
+        with open(TRIAL_LOG, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow({k: _cell(row.get(k)) for k in LOG_FIELDS})
+
+
+def read_history(n: int = 15) -> dict:
+    rows: list[dict] = []
+    try:
+        with _log_lock, open(TRIAL_LOG, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        pass
+    summary: dict[str, dict] = {}
+    for r in rows:
+        s = summary.setdefault(r.get("method") or "-", {"success": 0, "failure": 0, "undecided": 0, "error": 0})
+        if r.get("status") == "error":
+            s["error"] += 1
+        elif r.get("success") == "True":
+            s["success"] += 1
+        elif r.get("success") == "False":
+            s["failure"] += 1
+        else:
+            s["undecided"] += 1
+    keep = ["time", "method", "trial_id", "instruction", "placement", "steps", "success", "status", "video"]
+    return {"rows": [{k: r.get(k, "") for k in keep} for r in rows[-n:]][::-1], "summary": summary,
+            "total": len(rows), "path": str(TRIAL_LOG)}
 
 
 # ------------------------------------------------------------------------------- Robot Server process
@@ -166,7 +244,7 @@ class ServerManager:
         if subprocess.run(["sudo", "-n", "true"], stdin=subprocess.DEVNULL, capture_output=True).returncode != 0:
             raise HTTPException(409, "sudo password needed for setup_rt.sh: run `sudo -v` in the terminal that "
                                      "started the GUI (run_cacoflow_gui.sh does this at launch), then retry")
-        validate_impedance(cfg)
+        validate_config(cfg)
         if not (HERE / "run_server.sh").is_file():
             raise HTTPException(409, "run_server.sh not found: this copy has no Robot Server; "
                                      "start the Robot Server on the robot PC yourself")
@@ -205,15 +283,99 @@ class ServerManager:
             raise HTTPException(500, "Robot Server did not exit within 12 s (use the terminal)")
 
 
+# ------------------------------------------------------------------------------------ robot + video
+class GuiRobot(WsRobot):
+    """WsRobot that also keeps the full (un-zoomed) agent frame: for the preview and the recording.
+    The policy still gets the zoomed frame exactly as cacoflow_bridge.WsRobot produces it."""
+    _agent_full: Optional[np.ndarray] = None
+
+    def _decode(self, msg: dict, info: Optional[dict]):
+        agent, wrist = decode_rgb8_image(msg["agent"]), decode_rgb8_image(msg["wrist"])
+        self._agent_full = agent
+        if self.agent_zoom != 1.0 and not (info or {}).get("images_already_cropped", False):
+            agent = zoom_crop(agent, self.agent_zoom)
+        return agent, wrist
+
+    def full_frame(self) -> tuple[Optional[np.ndarray], float]:
+        with self._lock:
+            return self._agent_full, self._t_images
+
+
+class Recorder:
+    """Records the full-view agent camera to an mp4 (independent of trials; trials can start/stop it)."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.path: Optional[str] = None
+        self.frames = 0
+        self.started = 0.0
+        self.error = ""
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self, robot: GuiRobot, label: str) -> str:
+        if self.active:
+            raise HTTPException(409, "already recording")
+        if robot is None or robot._error is not None:
+            raise HTTPException(409, "robot not connected")
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        path = VIDEO_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{re.sub(r'[^A-Za-z0-9._+-]', '_', label)}.mp4"
+        self.path, self.frames, self.error, self.started = str(path), 0, "", time.time()
+        self._stop.clear()
+        self.active = True
+        self._thread = threading.Thread(target=self._run, args=(robot, path), daemon=True)
+        self._thread.start()
+        return str(path)
+
+    def _run(self, robot: GuiRobot, path: Path) -> None:
+        writer = None
+        last_t = 0.0
+        try:
+            import imageio.v2 as imageio
+            writer = imageio.get_writer(str(path), fps=RECORD_FPS, codec="libx264", quality=7, macro_block_size=1,
+                                        pixelformat="yuv420p")
+            while not self._stop.is_set():
+                frame, t = robot.full_frame()
+                if frame is not None and t != last_t:
+                    last_t = t
+                    h, w = frame.shape[:2]
+                    writer.append_data(frame[: h - h % 2, : w - w % 2])
+                    self.frames += 1
+                if robot._error is not None:
+                    self.error = f"robot connection lost: {robot._error}"
+                    break
+                time.sleep(0.01)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recording failed")
+            self.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                if writer is not None:
+                    writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.active = False
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def status(self) -> dict:
+        return {"active": self.active, "path": self.path, "frames": self.frames, "error": self.error,
+                "seconds": round(time.time() - self.started, 1) if self.active else None}
+
+
 # --------------------------------------------------------------------------------------- trial session
 class TrialParams(BaseModel):
     instruction: str = Field(min_length=1, max_length=300)
     gripper_one_means: Literal["closed", "open"]
-    trial_id: Optional[str] = Field(None, max_length=100)
+    trial_id: Optional[str] = Field(None, max_length=100, pattern=r"^[A-Za-z0-9._+-]*$")
     placement: Optional[str] = Field(None, max_length=100)
     appearance: Literal["seen", "unseen"] = "seen"
     max_steps: int = Field(60, ge=1, le=6000)
-    agent_zoom: float = Field(1.0, ge=1.0, le=3.0)
+    agent_zoom: float = Field(1.2, ge=1.0, le=3.0)
+    record: bool = True
     estop_ready: bool
 
 
@@ -226,6 +388,11 @@ class Outcome(BaseModel):
 class ConnectPolicy(BaseModel):
     token: str = Field("", max_length=500)
     ssh_password: str = Field("", max_length=200)
+    method: Optional[str] = None
+
+
+class RecordStart(BaseModel):
+    label: str = Field("manual", max_length=60)
 
 
 def jpeg(arr: np.ndarray, width: int = 480) -> bytes:
@@ -241,9 +408,11 @@ class Session:
         self.lock = threading.RLock()
         self.cfg = load_config()
         self.server = ServerManager()
+        self.recorder = Recorder()
         self.tunnel: Optional[SSHTunnel] = None
         self.client: Optional[InferenceClient] = None
-        self.robot: Optional[WsRobot] = None
+        self.robot: Optional[GuiRobot] = None
+        self.method_name = ""
         self.busy: Optional[str] = None                 # a long blocking operation in progress
         self.bringup: dict = {"step": "idle", "message": ""}
         self.trial_state = "idle"                       # idle | running | awaiting_outcome | error
@@ -280,7 +449,7 @@ class Session:
                     raise RuntimeError("Robot Server did not come up within 240 s")
                 time.sleep(0.5)
             self.bringup = {"step": "robot", "message": ""}
-            self.robot = WsRobot(self.cfg.robot_url, "closed", self.cfg.agent_zoom)
+            self.robot = GuiRobot(self.cfg.robot_url, "closed", self.cfg.agent_zoom)
             self.bringup = {"step": "done", "message": ""}
         except HTTPException as exc:
             self.bringup = {"step": "error", "message": str(exc.detail)}
@@ -291,6 +460,7 @@ class Session:
             self.busy = None
 
     def _close_robot(self) -> None:
+        self.recorder.stop()
         robot, self.robot = self.robot, None
         if robot is not None:
             robot.close()                               # sends "stop": the Robot Server stops its controller
@@ -314,15 +484,16 @@ class Session:
             if not token:
                 raise HTTPException(400, "CaCoFlow API token required")
             cfg, tunnel = self.cfg, None
+            method = cfg.method(body.method)
             try:
                 if cfg.policy_mode == "ssh":
                     # "" (not None): a failed key login must raise instead of prompting on the terminal
                     tunnel = SSHTunnel(cfg.ssh_host, cfg.ssh_port, cfg.ssh_user, ssh_password=body.ssh_password or "",
                                        ssh_key=cfg.ssh_key or None, remote_host="127.0.0.1",
-                                       remote_port=cfg.remote_policy_port)
+                                       remote_port=method.remote_policy_port)
                     url = f"http://127.0.0.1:{tunnel.start()}"
                 else:
-                    url = cfg.policy_url
+                    url = method.policy_url or cfg.policy_url
                 client = InferenceClient(url, token, cfg.timeout, cfg.max_observation_age)
             except HTTPException:
                 raise
@@ -330,7 +501,7 @@ class Session:
                 if tunnel is not None:
                     tunnel.close()
                 raise HTTPException(502, f"{type(exc).__name__}: {exc}") from exc
-            self.tunnel, self.client = tunnel, client
+            self.tunnel, self.client, self.method_name = tunnel, client, method.name
             return client.info
         finally:
             self.busy = None
@@ -339,6 +510,8 @@ class Session:
         with self.lock:
             if not force and (self.busy or self.trial_state == "running"):
                 raise HTTPException(409, "trial or connection in progress")
+            if self.trial_state == "awaiting_outcome":
+                self._log(status="unreported", notes="disconnected before the outcome was reported")
             self.client = None
             if self.tunnel is not None:
                 self.tunnel.close()
@@ -367,20 +540,23 @@ class Session:
                 raise HTTPException(400, "server is in mock mode")
             if list(info.get("action_shape", [])) != [10, 8]:
                 raise HTTPException(400, f"unexpected action_shape {info.get('action_shape')}")
-            if p.instruction not in info.get("tasks", []):
-                raise HTTPException(400, "instruction is not one of the server's tasks")
+            # An instruction typed by hand may not be one the server knows; the server decides (/reset error).
+            trial_id = p.trial_id or f"{re.sub(r'[^A-Za-z0-9]+', '', self.method_name) or 'trial'}_{time.strftime('%Y%m%d_%H%M%S')}"
             self.trial_state, self.trial_error, self.result = "running", "", None
-            self.trial_meta = {"instruction": p.instruction, "trial_id": p.trial_id or None,
+            self.trial_meta = {"instruction": p.instruction, "trial_id": trial_id, "method": self.method_name,
+                               "model_id": info.get("model_id"), "in_server_tasks": p.instruction in info.get("tasks", []),
                                "placement": p.placement or None, "appearance": p.appearance,
-                               "gripper_one_means": p.gripper_one_means, "max_steps": p.max_steps}
+                               "gripper_one_means": p.gripper_one_means, "max_steps": p.max_steps,
+                               "agent_zoom": p.agent_zoom, "video": None}
             self.progress = {"step": 0, "max_steps": p.max_steps, "chunks": 0, "last_rt_ms": None,
                              "rt_ms": [], "started": time.time(), "stopped": False}
             self.stop_flag.clear()
-            self.thread = threading.Thread(target=self._run_trial, args=(p, client, robot), daemon=True)
+            self.thread = threading.Thread(target=self._run_trial, args=(p, trial_id, client, robot), daemon=True)
             self.thread.start()
 
-    def _run_trial(self, p: TrialParams, client: InferenceClient, robot: WsRobot) -> None:
+    def _run_trial(self, p: TrialParams, trial_id: str, client: InferenceClient, robot: GuiRobot) -> None:
         orig_predict = client.predict
+        auto_recording = False
         try:
             robot.one_is_closed = p.gripper_one_means == "closed"
             robot.agent_zoom = p.agent_zoom
@@ -389,6 +565,12 @@ class Session:
             deadline = t0 + 1.0
             while robot._t_images <= t0 and time.monotonic() < deadline:
                 time.sleep(0.01)
+            if p.record:
+                if self.recorder.active:                # a manual recording is already running: keep it
+                    self.trial_meta["video"] = self.recorder.path
+                else:
+                    self.trial_meta["video"] = self.recorder.start(robot, trial_id)
+                    auto_recording = True
 
             def predict(*a, **k):
                 if self.stop_flag.is_set():
@@ -406,20 +588,26 @@ class Session:
                     raise KeyboardInterrupt             # run_trial turns this into "operator stop" + hold
 
             client.predict = predict
-            res = run_trial(client, robot, p.instruction, trial_id=p.trial_id or None, placement=p.placement or None,
+            res = run_trial(client, robot, p.instruction, trial_id=trial_id, placement=p.placement or None,
                             appearance=p.appearance, max_steps=p.max_steps, on_step=on_step)
             self.result = {"steps": res["steps"], "chunks": res["chunks"], "clipped_steps": res["clipped_steps"]}
             self.progress["stopped"] = self.stop_flag.is_set()
-            self.trial_state = "awaiting_outcome" if client.session_id is not None else "error"
-            if self.trial_state == "error":
+            if client.session_id is not None:
+                self.trial_state = "awaiting_outcome"
+            else:
                 self.trial_error = "session closed by the client"
+                self._log(status="error", error=self.trial_error)
+                self.trial_state = "error"
         except Exception as exc:  # noqa: BLE001
             logger.exception("trial failed")
             robot.hold()
             self.trial_error = f"{type(exc).__name__}: {exc}"
+            self._log(status="error", error=self.trial_error)
             self.trial_state = "error"
         finally:
             client.__dict__.pop("predict", None)
+            if auto_recording:
+                self.recorder.stop()
             self.progress["ended"] = time.time()
 
     def stop_trial(self) -> None:
@@ -430,21 +618,50 @@ class Session:
             if self.robot is not None:
                 self.robot.hold()                       # immediate hold; run_trial holds again when it unwinds
 
+    def _log(self, status: str, outcome: Optional[Outcome] = None, error: str = "", notes: str = "",
+             server_trial_dir: Optional[str] = None) -> None:
+        m, res, prog = self.trial_meta, self.result or {}, self.progress
+        rt = prog.get("rt_ms") or []
+        try:
+            log_trial({**m, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "steps": res.get("steps", prog.get("step")),
+                       "chunks": res.get("chunks", prog.get("chunks")), "clipped_steps": res.get("clipped_steps"),
+                       "rt_median_ms": round(float(np.median(rt))) if rt else None, "stopped": prog.get("stopped"),
+                       "success": None if outcome is None else outcome.success,
+                       "wrong_object": None if outcome is None else outcome.wrong_object,
+                       "notes": (outcome.notes if outcome is not None else notes), "status": status, "error": error,
+                       "server_trial_dir": server_trial_dir})
+        except OSError:
+            logger.exception("could not write the trial log")
+
     def report_outcome(self, o: Outcome) -> dict:
         with self.lock:
             if self.trial_state != "awaiting_outcome" or self.client is None:
                 raise HTTPException(409, "no trial waiting for an outcome")
+            server_error, trial_dir = "", None
             try:
                 end = self.client.end_trial(success=o.success, wrong_object=o.wrong_object, notes=o.notes)
+                trial_dir = end.get("trial_dir")
             except Exception as exc:  # noqa: BLE001
-                raise HTTPException(502, f"{type(exc).__name__}: {exc}") from exc
+                server_error = f"{type(exc).__name__}: {exc}"
+            # Always keep the local record, even if the server could not take it.
+            self._log(status="ok" if not server_error else "server_error", outcome=o, error=server_error,
+                      server_trial_dir=trial_dir)
             self.trial_state = "idle"
-            return {"trial_dir": end.get("trial_dir")}
+            return {"trial_dir": trial_dir, "server_error": server_error, "log": str(TRIAL_LOG)}
 
     def dismiss_error(self) -> None:
         with self.lock:
             if self.trial_state == "error":
                 self.trial_state, self.trial_error = "idle", ""
+
+    # --- recording (manual) ---
+    def start_recording(self, label: str) -> str:
+        with self.lock:
+            return self.recorder.start(self.robot, label)
+
+    def stop_recording(self) -> dict:
+        self.recorder.stop()
+        return self.recorder.status()
 
     # --- state snapshot ---
     def robot_snapshot(self) -> dict:
@@ -476,10 +693,13 @@ class Session:
                        "log": tail(SERVER_LOG, 25)},
             "bringup": self.bringup, "busy": self.busy,
             "robot": self.robot_snapshot(),
-            "policy": {"connected": self.client is not None,
+            "policy": {"connected": self.client is not None, "method": self.method_name,
                        "info": self.client.info if self.client is not None else None},
             "trial": {"state": self.trial_state, "error": self.trial_error, "meta": self.trial_meta,
                       "progress": prog, "result": self.result},
+            "recording": self.recorder.status(),
+            "methods": [m.name for m in self.cfg.methods],
+            "data_dir": str(DATA_DIR),
             "token_in_env": bool(os.environ.get("CACOFLOW_API_TOKEN")),
         }
 
@@ -489,6 +709,7 @@ class Session:
                 self.stop_flag.set()
                 if self.thread is not None:
                     self.thread.join(timeout=8)
+            self.recorder.stop()
             if self.robot is not None:
                 self.robot.hold()
                 self._close_robot()
@@ -544,6 +765,11 @@ def api_state() -> dict:
     return S.snapshot()
 
 
+@app.get("/api/history")
+def api_history() -> dict:
+    return read_history()
+
+
 @app.get("/api/config")
 def api_get_config() -> dict:
     return S.cfg.model_dump()
@@ -551,7 +777,7 @@ def api_get_config() -> dict:
 
 @app.post("/api/config")
 def api_set_config(cfg: Config) -> dict:
-    validate_impedance(cfg)
+    validate_config(cfg)
     with S.lock:
         S.cfg = cfg
         save_config(cfg)
@@ -613,13 +839,26 @@ def api_trial_dismiss() -> dict:
     return {"ok": True}
 
 
+@app.post("/api/record/start")
+def api_record_start(body: RecordStart) -> dict:
+    return {"path": S.start_recording(body.label)}
+
+
+@app.post("/api/record/stop")
+def api_record_stop() -> dict:
+    return S.stop_recording()
+
+
 @app.get("/api/camera/{role}.jpg")
 def api_camera(role: Literal["agent", "wrist"]) -> Response:
     r = S.robot
     if r is None or r._error is not None:
         raise HTTPException(404, "robot not connected")
-    with r._lock:
-        arr = r._agent if role == "agent" else r._wrist
+    if role == "agent":                                 # full view, not the zoomed policy input
+        arr, _ = r.full_frame()
+    else:
+        with r._lock:
+            arr = r._wrist
     if arr is None:
         raise HTTPException(404, "no frame yet")
     return Response(jpeg(arr), media_type="image/jpeg", headers={"Cache-Control": "no-store"})

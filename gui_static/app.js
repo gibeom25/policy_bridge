@@ -1,13 +1,16 @@
-// policy_bridge CaCoFlow dashboard -- vanilla JS. Server-provided strings (task names, errors, logs) are only
-// ever rendered with textContent, never innerHTML.
+// policy_bridge CaCoFlow dashboard -- vanilla JS. Server-provided strings (task names, errors, logs, history)
+// are only ever rendered with textContent, never innerHTML.
 const $ = (id) => document.getElementById(id);
 let state = null;
 let actionError = "";
 let lastTasks = "";
+let lastMethods = "";
+let cfgZoom = 1.2;
+const METHOD_ROWS = 3;
 
 // ------------------------------------------------------------------------------ i18n / tabs
 document.querySelectorAll(".lang-toggle button").forEach((b) => b.addEventListener("click", () => setLang(b.dataset.lang)));
-function onLangChange() { if (state) render(); }
+function onLangChange() { if (state) render(); loadHistory(); }
 
 function setTab(name) {
   document.querySelectorAll(".tab-page").forEach((el) => el.classList.toggle("hidden", el.dataset.tab !== name));
@@ -51,26 +54,51 @@ for (let i = 0; i < 7; i++) {
   const inp = document.createElement("input"); inp.type = "number"; inp.step = "50"; inp.id = `imp-${i}`;
   l.append(s, inp); impGrid.append(l);
 }
+const mGrid = $("methods-grid");
+for (let i = 0; i < METHOD_ROWS; i++) {
+  const row = document.createElement("div"); row.className = "row";
+  for (const [id, label, type, w] of [[`m-name-${i}`, "name", "text", "1 1 160px"], [`m-port-${i}`, "remote port", "number", "0 1 120px"],
+    [`m-url-${i}`, "direct URL (url mode)", "text", "2 1 240px"]]) {
+    const l = document.createElement("label"); l.style.flex = w;
+    const s = document.createElement("span"); s.textContent = label;
+    const inp = document.createElement("input"); inp.type = type; inp.id = id;
+    l.append(s, inp); row.append(l);
+  }
+  mGrid.append(row);
+}
 
 function fillConfig(c) {
   $("robot-url").value = c.robot_url;
   $("policy-mode").value = c.policy_mode;
   $("ssh-host").value = c.ssh_host; $("ssh-port").value = c.ssh_port; $("ssh-user").value = c.ssh_user;
-  $("ssh-key").value = c.ssh_key; $("remote-port").value = c.remote_policy_port; $("policy-url").value = c.policy_url;
+  $("ssh-key").value = c.ssh_key; $("policy-url").value = c.policy_url;
   $("agent-zoom").value = c.agent_zoom; $("timeout").value = c.timeout; $("max-age").value = c.max_observation_age;
+  $("cfg-auto-record").checked = c.auto_record;
+  for (let i = 0; i < METHOD_ROWS; i++) {
+    const m = c.methods[i];
+    $(`m-name-${i}`).value = m ? m.name : ""; $(`m-port-${i}`).value = m ? m.remote_policy_port : "";
+    $(`m-url-${i}`).value = m ? m.policy_url : "";
+  }
   c.joint_impedance.forEach((v, i) => { $(`imp-${i}`).value = v; });
   $("v-max").value = c.v_max; $("a-max").value = c.a_max; $("j-max").value = c.j_max; $("filter-wn").value = c.filter_wn;
   $("auto-start").checked = c.auto_start_server;
+  cfgZoom = c.agent_zoom;
   syncModeFields();
 }
 
 function readConfig() {
   const n = (id) => Number($(id).value);
+  const methods = [];
+  for (let i = 0; i < METHOD_ROWS; i++) {
+    const name = $(`m-name-${i}`).value.trim();
+    if (name) methods.push({ name, remote_policy_port: n(`m-port-${i}`) || 8000, policy_url: $(`m-url-${i}`).value.trim() });
+  }
   return {
     robot_url: $("robot-url").value.trim(), policy_mode: $("policy-mode").value,
     ssh_host: $("ssh-host").value.trim(), ssh_port: n("ssh-port"), ssh_user: $("ssh-user").value.trim(),
-    ssh_key: $("ssh-key").value.trim(), remote_policy_port: n("remote-port"), policy_url: $("policy-url").value.trim(),
+    ssh_key: $("ssh-key").value.trim(), policy_url: $("policy-url").value.trim(), methods,
     agent_zoom: n("agent-zoom"), timeout: n("timeout"), max_observation_age: n("max-age"),
+    auto_record: $("cfg-auto-record").checked,
     joint_impedance: [0, 1, 2, 3, 4, 5, 6].map((i) => n(`imp-${i}`)),
     v_max: n("v-max"), a_max: n("a-max"), j_max: n("j-max"), filter_wn: n("filter-wn"),
     auto_start_server: $("auto-start").checked,
@@ -95,33 +123,45 @@ $("btn-save").addEventListener("click", () => act(async () => {
 }));
 
 // -------------------------------------------------------------------------------- actions
+const effectiveInstruction = () => $("instruction-custom").value.trim() || $("instruction").value;
+
 $("btn-prepare").addEventListener("click", () => act(() => api("POST", "/api/robot/prepare")));
 $("btn-robot-disc").addEventListener("click", () => act(() => api("POST", "/api/robot/disconnect")));
 $("btn-server-stop").addEventListener("click", () => act(() => api("POST", "/api/server/stop")));
 $("btn-policy-connect").addEventListener("click", () => act(async () => {
-  await api("POST", "/api/policy/connect", { token: $("token").value, ssh_password: $("ssh-password").value });
+  await api("POST", "/api/policy/connect", { token: $("token").value, ssh_password: $("ssh-password").value, method: $("method").value || null });
 }));
 $("btn-policy-disc").addEventListener("click", () => act(() => api("POST", "/api/policy/disconnect")));
+$("btn-rec-start").addEventListener("click", () => act(() => api("POST", "/api/record/start", { label: "manual" })));
+$("btn-rec-stop").addEventListener("click", () => act(() => api("POST", "/api/record/stop")));
 $("btn-stop").addEventListener("click", () => act(() => api("POST", "/api/trial/stop")));
 $("btn-start").addEventListener("click", () => act(async () => {
   if (!$("gripper-one").value) throw new Error(t("msg.need_gripper"));
   const opt = (id) => $(id).value.trim() || null;
   await api("POST", "/api/trial/start", {
-    instruction: $("instruction").value, gripper_one_means: $("gripper-one").value,
+    instruction: effectiveInstruction(), gripper_one_means: $("gripper-one").value,
     trial_id: opt("trial-id"), placement: opt("placement"), appearance: $("appearance").value,
-    max_steps: Number($("max-steps").value), agent_zoom: Number($("agent-zoom").value) || 1.0,
+    max_steps: Number($("max-steps").value), agent_zoom: cfgZoom, record: $("auto-record").checked,
     estop_ready: $("estop-ready").checked,
   });
   $("estop-ready").checked = false;          // re-confirm for every trial
+  $("trial-id").value = "";                  // next trial gets a fresh automatic id
 }));
-$("btn-outcome").addEventListener("click", () => act(async () => {
-  const tri = (v) => (v === "" ? null : v === "true");
-  const r = await api("POST", "/api/trial/outcome", {
-    success: tri($("out-success").value), wrong_object: tri($("out-wrong").value), notes: $("out-notes").value,
+
+function sendOutcome(success) {
+  return act(async () => {
+    const r = await api("POST", "/api/trial/outcome", {
+      success, wrong_object: $("out-wrong").value === "" ? null : $("out-wrong").value === "true", notes: $("out-notes").value,
+    });
+    $("out-wrong").value = ""; $("out-notes").value = "";
+    if (r.server_error) { actionError = t("outcome.server_error", { err: r.server_error }); }
+    else showBanner(t("outcome.saved", { dir: r.trial_dir || "-" }), "info");
+    loadHistory();
   });
-  $("out-success").value = ""; $("out-wrong").value = ""; $("out-notes").value = "";
-  actionError = ""; showBanner(t("outcome.saved", { dir: r.trial_dir || "-" }), "info");
-}));
+}
+$("btn-success").addEventListener("click", () => sendOutcome(true));
+$("btn-failure").addEventListener("click", () => sendOutcome(false));
+$("btn-undecided").addEventListener("click", () => sendOutcome(null));
 
 // ---------------------------------------------------------------------------------- render
 function showBanner(msg, kind) {
@@ -168,15 +208,11 @@ function renderInfo(info) {
   }
 }
 
-function renderInstructions(info) {
-  const tasks = (info && info.tasks) || [];
-  const key = tasks.join("\n");
-  if (key === lastTasks) return;
-  lastTasks = key;
-  const sel = $("instruction"); const prev = sel.value;
+function fillSelect(sel, values) {
+  const prev = sel.value;
   sel.replaceChildren();
-  for (const task of tasks) { const o = document.createElement("option"); o.value = task; o.textContent = task; sel.append(o); }
-  if (tasks.includes(prev)) sel.value = prev;
+  for (const v of values) { const o = document.createElement("option"); o.value = v; o.textContent = v; sel.append(o); }
+  if (values.includes(prev)) sel.value = prev;
 }
 
 function render() {
@@ -184,18 +220,16 @@ function render() {
   const badge = badgeOf(s);
   const bd = $("state-badge"); bd.className = "badge " + badge; bd.textContent = t("badge." + badge);
 
-  // banners: most important first
   let msg = "";
   if (actionError) msg = actionError;
   else if (s.trial.state === "error") msg = t("err.trial") + s.trial.error;
   else if (s.bringup.step === "error") msg = t("err.bringup") + s.bringup.message;
   else if (s.robot.error) msg = t("err.robot") + s.robot.error;
+  else if (s.recording.error) msg = t("err.record") + s.recording.error;
   else if (s.server.message) msg = s.server.message;
   if (msg || !$("banner").classList.contains("info")) showBanner(msg);
 
-  // server / robot
-  const srvKey = "srv." + s.server.state;
-  let line = t(srvKey);
+  let line = t("srv." + s.server.state);
   if (s.bringup.step === "server") line += "  · " + t("bring.server");
   if (s.bringup.step === "robot") line += "  · " + t("bring.robot");
   if (s.server.restart_needed) line += t("srv.restart");
@@ -213,8 +247,20 @@ function render() {
   }
   stats($("telemetry-grid"), items);
 
+  // methods + instructions
+  const mkey = (s.methods || []).join("\n");
+  if (mkey !== lastMethods) { lastMethods = mkey; fillSelect($("method"), s.methods || []); }
+  $("policy-method").textContent = s.policy.connected ? t("policy.connected_to", { m: s.policy.method }) : "";
   renderInfo(s.policy.info);
-  renderInstructions(s.policy.info);
+  const tasks = (s.policy.info && s.policy.info.tasks) || [];
+  if (tasks.join("\n") !== lastTasks) { lastTasks = tasks.join("\n"); fillSelect($("instruction"), tasks); }
+  const custom = $("instruction-custom").value.trim();
+  $("custom-warn").classList.toggle("hidden", !(custom && !tasks.includes(custom)));
+
+  // recording
+  const rec = s.recording;
+  $("rec-status").textContent = rec.active ? t("rec.active", { s: f(rec.seconds, 0), n: rec.frames })
+    : (rec.path ? t("rec.last", { p: rec.path, n: rec.frames }) : "");
 
   // trial progress
   const p = s.trial.progress || {}; const running = s.trial.state === "running";
@@ -230,10 +276,10 @@ function render() {
     ]);
   } else { $("progress-grid").replaceChildren(); }
 
-  // button states
+  // buttons
   const busy = !!s.busy;
   const canStart = s.policy.connected && r.connected && s.trial.state === "idle" && !busy
-    && $("gripper-one").value && $("estop-ready").checked && $("instruction").value;
+    && $("gripper-one").value && $("estop-ready").checked && effectiveInstruction();
   $("btn-start").disabled = !canStart;
   $("btn-stop").disabled = !running;
   $("btn-prepare").disabled = busy || running || r.connected || s.server.state === "starting";
@@ -241,14 +287,41 @@ function render() {
   $("btn-server-stop").disabled = busy || running || r.connected || s.server.state === "stopped";
   $("btn-policy-connect").disabled = busy || running;
   $("btn-policy-disc").disabled = busy || running || !s.policy.connected;
+  $("btn-rec-start").disabled = !r.connected || rec.active;
+  $("btn-rec-stop").disabled = !rec.active || running;
   $("panel-outcome").classList.toggle("hidden", s.trial.state !== "awaiting_outcome");
-  for (const id of ["instruction", "gripper-one", "trial-id", "placement", "appearance", "max-steps", "estop-ready"]) $(id).disabled = running;
+  $("data-dir").textContent = t("hist.dir", { d: s.data_dir });
+  for (const id of ["instruction", "instruction-custom", "gripper-one", "trial-id", "placement", "appearance", "max-steps",
+    "estop-ready", "auto-record"]) $(id).disabled = running;
 }
 ["gripper-one", "estop-ready", "instruction"].forEach((id) => $(id).addEventListener("change", render));
+$("instruction-custom").addEventListener("input", render);
 
 async function refresh() {
   try { state = await api("GET", "/api/state"); } catch (e) { actionError = e.message; }
   render();
+}
+
+// ---------------------------------------------------------------------------------- history
+async function loadHistory() {
+  let h;
+  try { h = await api("GET", "/api/history"); } catch (e) { return; }
+  const parts = Object.entries(h.summary).map(([m, s]) => {
+    const done = s.success + s.failure;
+    const rate = done ? ` (${Math.round((100 * s.success) / done)}%)` : "";
+    return t("hist.summary", { m, s: s.success, f: s.failure, u: s.undecided, e: s.error, rate });
+  });
+  $("hist-summary").textContent = parts.join("   |   ") || t("hist.none");
+  const tb = $("hist-body"); tb.replaceChildren();
+  for (const r of h.rows) {
+    const tr = document.createElement("tr");
+    const res = r.status === "error" ? t("hist.error") : r.success === "True" ? t("hist.ok") : r.success === "False" ? t("hist.fail") : t("hist.und");
+    const vid = r.video ? r.video.split("/").pop() : "";
+    for (const v of [r.time, r.method, r.trial_id, r.instruction, res, vid]) {
+      const td = document.createElement("td"); td.textContent = v; tr.append(td);
+    }
+    tb.append(tr);
+  }
 }
 
 // ----------------------------------------------------------------------------------- polling
@@ -263,7 +336,10 @@ function tickCams() {
 }
 
 setLang(getLang());
-api("GET", "/api/config").then(fillConfig).catch((e) => { actionError = e.message; });
+api("GET", "/api/config").then((c) => { fillConfig(c); $("auto-record").checked = c.auto_record; })
+  .catch((e) => { actionError = e.message; });
 refresh();
+loadHistory();
 setInterval(refresh, 500);
 setInterval(tickCams, 300);
+setInterval(loadHistory, 5000);
