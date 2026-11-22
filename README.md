@@ -44,3 +44,5 @@ sudo apt install ethtool linux-tools-$(uname -r)    # setup_rt.sh / rt_check.sh 
 
 점검: `sudo ./rt_check.sh` (60초, 1 ms 넘는 지연이 생기면 원인 스택 출력 → `rtla.log`).
 Franka는 Intel 유선 랜카드를 권장한다. Realtek 유선(r8169)에서는 위 설정 후에도 명령이 연속 유실된 사례가 있다.
+
+CaCoFlow 정책 서버(협업자, HTTP): [CACOFLOW.md](CACOFLOW.md)
