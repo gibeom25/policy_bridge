@@ -267,6 +267,76 @@ RESET_Q = [0.0, -0.161037389, 0.0, -2.44459747, 0.0, 2.2267522, 0.785398]   # st
 
 
 # ============================================================================
+# 3b. Action timeline (openpi-style action chunk execution)
+# ============================================================================
+
+class ActionTimeline:
+    """Action chunks placed on ONE global 15 Hz step axis, executed by a separate 120 Hz loop.
+
+    openpi executes a chunk open-loop (ActionChunkBroker: infer, play `action_horizon` steps, infer again).
+    Done asynchronously (infer while the robot keeps moving), a new chunk is planned from an observation that
+    is already old when the chunk arrives, so naively playing it from actions[0] drags the target BACK to where
+    the robot was -> the robot oscillates at every chunk boundary. Here every chunk row gets the absolute step
+    it belongs to (observation time, not arrival time), so:
+      * rows whose step has already been executed are dropped (latency compensation),
+      * the step currently being executed is never changed (no jump inside a segment),
+      * the first `blend_steps` overlapping steps cross-fade old -> new (no kink at the seam).
+
+    Step k is the joint target reached at the END of step k. `p` (float) is the commanded position on the step
+    axis: p = k - 1 + sub/8 while interpolating towards step k."""
+
+    def __init__(self, blend_steps: int = 3) -> None:
+        self.blend_steps = max(0, int(blend_steps))
+        self.rows: dict[int, np.ndarray] = {}           # step -> (8,) action row
+        self.k_exec: int = 0                            # step currently executed (its target is committed)
+        self.p_hist: deque = deque(maxlen=600)          # (monotonic time, p), ~5 s at 120 Hz
+        self.p_hist.append((time.monotonic(), 0.0))
+
+    @property
+    def end_step(self) -> int:
+        return max(self.rows) if self.rows else self.k_exec
+
+    def remaining(self) -> int:
+        """Steps left after the one being executed."""
+        return max(0, self.end_step - self.k_exec)
+
+    def p_at(self, t: float) -> float:
+        """Commanded step position at monotonic time t (from the execution history)."""
+        for t_h, p_h in reversed(self.p_hist):
+            if t_h <= t:
+                return p_h
+        return self.p_hist[0][1]
+
+    def merge(self, chunk: np.ndarray, first_step: int, horizon: int) -> dict[str, Any]:
+        """Place chunk[i] at step first_step + i (i < horizon) and return seam statistics."""
+        n = min(int(horizon), chunk.shape[0])
+        k = self.k_exec
+        dropped, blended, seam = 0, 0, float("nan")
+        new_rows: dict[int, np.ndarray] = {}
+        for i in range(n):
+            s = first_step + i
+            if s <= k:                                   # already executed (or being executed): keep it
+                dropped += 1
+                continue
+            row = np.asarray(chunk[i], dtype=np.float64).copy()
+            old = self.rows.get(s)
+            if old is not None and self.blend_steps > 0:
+                w = min(1.0, (s - k) / (self.blend_steps + 1))
+                if w < 1.0:
+                    row = (1.0 - w) * old + w * row
+                    blended += 1
+            if s == k + 1 and old is not None:
+                seam = float(np.max(np.abs(row[:7] - old[:7])))
+            new_rows[s] = row
+        # The newest chunk owns the future: drop older rows past its end, keep the committed history.
+        self.rows = {s: r for s, r in self.rows.items() if s <= k}
+        self.rows.update(new_rows)
+        for s in [s for s in self.rows if s < k - 1]:
+            del self.rows[s]
+        return {"dropped": dropped, "blended": blended, "used": len(new_rows), "seam": seam}
+
+
+# ============================================================================
 # 4. Robot State Buffer & Bridge Client
 # ============================================================================
 
@@ -327,6 +397,10 @@ class RobotPolicyBridge:
         max_dq: float = 0.25,
         settle_tol: float = 0.01,
         settle_timeout: float = 0.4,
+        exec_mode: str = "async",
+        replan_steps: int = 6,
+        blend_steps: int = 3,
+        obs_lag: float = 0.25,
     ) -> None:
         self.robot_url = robot_url
         self.policy_url = policy_url
@@ -343,6 +417,12 @@ class RobotPolicyBridge:
         self.settle_tol = settle_tol
         self.settle_timeout = settle_timeout
         self.n_overruns = 0                              # 120 Hz ticks where the event loop fell > 1 tick behind
+        self.exec_mode = exec_mode                       # "async": infer while moving; "sync": stop, infer, play
+        self.replan_steps = max(1, int(replan_steps))    # openpi action_horizon: steps played per chunk before re-query
+        self.obs_lag = float(obs_lag) if exec_mode == "async" else 0.0
+        self.timeline = ActionTimeline(blend_steps)
+        self.n_underruns = 0                             # times the 120 Hz executor ran out of actions and held
+        self._latency_ema: Optional[float] = None        # s, observation -> chunk merged
 
         self.session = RobotSessionState()
         self.last_gripper_close: Optional[bool] = None
@@ -573,62 +653,65 @@ class RobotPolicyBridge:
         err = await self.wait_settled(self.settle_tol, max(self.settle_timeout, 1.0))
         logger.info("Reached start pose (tracking error %.4f rad).", err)
 
-    async def execute_action_chunk(
-        self,
-        robot_ws: websockets.ClientConnection,
-        actions: np.ndarray,
-    ) -> None:
-        """Execute the first 8 actions of a (16, 8) chunk at 15 Hz, upsampled to 120 Hz joint_target."""
-        if actions.ndim != 2 or actions.shape[1] != 8:
-            raise ValueError(f"Expected actions shape (N, 8), got {actions.shape}")
+    def _check_step(self, q_from: np.ndarray, q_to: np.ndarray) -> None:
+        # [FIX 5] refuse targets outside the joint limits or jumping more than max_dq rad in one policy step
+        if np.any(q_to < Q_LO) or np.any(q_to > Q_HI):
+            raise RuntimeError(f"safety stop: joint target outside the limits: {np.round(q_to, 3)}")
+        jump = float(np.max(np.abs(q_to - q_from)))
+        if jump > self.max_dq:
+            raise RuntimeError(f"safety stop: joint target jumps {jump:.3f} rad in one step (limit {self.max_dq})")
 
-        num_to_exec = min(self.ACTIONS_PER_DECISION, actions.shape[0])
-        dt_robot = 1.0 / self.ROBOT_TARGET_RATE_HZ  # 1/120 s = 8.333 ms
-        dt_action = self.SECONDS_PER_ACTION         # 1/15 s  = 66.667 ms
+    async def _executor_loop(self, robot_ws: websockets.ClientConnection) -> None:
+        """120 Hz: play the action timeline step by step (each 15 Hz step = 8 linear substeps).
 
+        Runs independently of inference. When no next step is available the last target is held (underrun) and
+        playback resumes as soon as a chunk is merged. Only the step being executed is committed; everything
+        after it may be replaced by a newer chunk."""
+        tl = self.timeline
+        dt_robot = 1.0 / self.ROBOT_TARGET_RATE_HZ
+        n_sub = self.SUBSTEPS_PER_ACTION
         if self.last_commanded_q is not None:
-            q_prev = self.last_commanded_q.copy()
+            q_from = self.last_commanded_q.copy()
         else:
             assert self.session.joint_position is not None
-            q_prev = self.session.joint_position.astype(np.float64).copy()
-
+            q_from = self.session.joint_position.astype(np.float64).copy()
+        q_to = q_from.copy()
+        tl.rows[tl.k_exec] = np.concatenate([q_from, [1.0 if self.last_gripper_close else 0.0]])
+        dq_step = np.zeros(7)
+        sub = n_sub                      # step k_exec already finished
+        holding = True
         t0 = time.perf_counter()
         tick = 0
-
-        for act_idx in range(num_to_exec):
+        while True:
             if self.session.error_event.is_set():
-                raise RuntimeError(f"Robot error during chunk execution: {self.session.error}")
+                raise RuntimeError(f"Robot error during execution: {self.session.error}")
+            if sub >= n_sub:
+                nxt = tl.rows.get(tl.k_exec + 1)
+                if nxt is None:
+                    if not holding:      # ran out of actions: hold the last target, zero feed-forward velocity
+                        holding = True
+                        self.n_underruns += 1
+                        await self.send_joint_target(robot_ws, q_from, np.zeros(7))
+                    tl.p_hist.append((time.monotonic(), float(tl.k_exec)))
+                    tick += 1
+                    t0 = await self._wait_tick(t0, tick, dt_robot)
+                    continue
+                q_to = np.asarray(nxt[:7], dtype=np.float64)
+                self._check_step(q_from, q_to)
+                await self.send_gripper_if_changed(robot_ws, float(nxt[7]) >= self.GRIPPER_THRESHOLD)
+                tl.k_exec += 1
+                sub = 0
+                holding = False
+                dq_step = (q_to - q_from) / self.SECONDS_PER_ACTION
 
-            row = actions[act_idx]
-            q_next = np.asarray(row[:7], dtype=np.float64)
-            gripper_val = float(row[7])
-            # [FIX 5] refuse targets outside the joint limits or jumping more than max_dq rad in one policy step
-            if np.any(q_next < Q_LO) or np.any(q_next > Q_HI):
-                raise RuntimeError(f"safety stop: joint target outside the limits: {np.round(q_next, 3)}")
-            jump = float(np.max(np.abs(q_next - q_prev)))
-            if jump > self.max_dq:
-                raise RuntimeError(f"safety stop: joint target jumps {jump:.3f} rad in one step (limit {self.max_dq})")
-
-            # Threshold gripper at 0.5 and send ONLY if changed
-            close_cmd = gripper_val >= self.GRIPPER_THRESHOLD
-            await self.send_gripper_if_changed(robot_ws, close_cmd)
-
-            # Constant feed-forward velocity across the 66.7ms action step
-            dq_step = (q_next - q_prev) / dt_action
-
-            # Upsample 15 Hz action step into 8 substeps at 120 Hz
-            for sub in range(1, self.SUBSTEPS_PER_ACTION + 1):
-                if self.session.error_event.is_set():
-                    raise RuntimeError(f"Robot error during chunk execution: {self.session.error}")
-                frac = sub / self.SUBSTEPS_PER_ACTION
-                q_interp = q_prev + frac * (q_next - q_prev)
-                dq_cmd = dq_step if act_idx < num_to_exec - 1 or sub < self.SUBSTEPS_PER_ACTION else np.zeros(7)
-                await self.send_joint_target(robot_ws, q_interp, dq_cmd)
-
-                tick += 1
-                t0 = await self._wait_tick(t0, tick, dt_robot)
-
-            q_prev = q_next
+            sub += 1
+            q_cmd = q_from + (sub / n_sub) * (q_to - q_from)
+            await self.send_joint_target(robot_ws, q_cmd, dq_step)
+            tl.p_hist.append((time.monotonic(), tl.k_exec - 1 + sub / n_sub))
+            if sub >= n_sub:
+                q_from = q_to
+            tick += 1
+            t0 = await self._wait_tick(t0, tick, dt_robot)
 
     # ------------------------------------------------------------------
     # Policy Server request/response (policy_output_format.json)
@@ -667,7 +750,7 @@ class RobotPolicyBridge:
     ) -> dict[str, Any]:
         """Send observation to Policy Server and unpack the msgpack response."""
         req = self.build_policy_request()
-        await policy_ws.send(pack_msg(req))
+        await policy_ws.send(await asyncio.to_thread(pack_msg, req))   # off the loop: the 120 Hz executor runs
 
         raw_reply = await policy_ws.recv()
         # Per policy_output_format.json:
@@ -675,10 +758,95 @@ class RobotPolicyBridge:
         if isinstance(raw_reply, str):
             raise RuntimeError(f"Policy Server returned error traceback:\n{raw_reply}")
 
-        resp = unpack_msg(raw_reply)
+        resp = await asyncio.to_thread(unpack_msg, raw_reply)
         if "actions" not in resp:
             raise ValueError(f"Policy Server response missing 'actions' field: {list(resp.keys())}")
         return resp
+
+    def _raise_if_error(self) -> None:
+        if self.session.error_event.is_set():
+            raise RuntimeError(f"Stopping trial due to robot error: {self.session.error}")
+
+    async def _inference_loop(self, policy_ws: websockets.ClientConnection) -> None:
+        """Query the policy and merge each chunk into the timeline (openpi ActionChunkBroker semantics).
+
+        sync : wait until the timeline is played out, settle, infer, play `replan_steps` actions (robot pauses).
+        async: re-query after `replan_steps` steps (or earlier if the buffer would run dry before the reply),
+               while the executor keeps moving. Each chunk is anchored at the step the robot was commanded to
+               `obs_lag` s before the observation (the server's reference filter makes the measured joints lag
+               the commanded ones by ~2/wn = 0.25 s), so stale rows are dropped instead of pulling the robot back."""
+        tl = self.timeline
+        decision_idx = 0
+        last_obs_step = tl.k_exec
+        while True:
+            self._raise_if_error()
+            if 0 < self.max_decisions <= decision_idx:
+                logger.info("Reached max_decisions=%d. Playing the remaining %d steps.", self.max_decisions,
+                            tl.remaining())
+                while tl.remaining() > 0:
+                    self._raise_if_error()
+                    await asyncio.sleep(0.005)
+                return
+
+            # --- when to query ---
+            settle_ms, track_err = 0.0, float("nan")
+            if self.exec_mode == "sync" or decision_idx == 0:
+                while tl.remaining() > 0:
+                    self._raise_if_error()
+                    await asyncio.sleep(0.002)
+                t_settle = time.perf_counter()
+                track_err = await self.wait_settled(self.settle_tol, self.settle_timeout)
+                settle_ms = (time.perf_counter() - t_settle) * 1000.0
+            else:
+                lat_steps = math.ceil(self._latency_ema / self.SECONDS_PER_ACTION) if self._latency_ema else 3
+                while tl.k_exec - last_obs_step < self.replan_steps and tl.remaining() > lat_steps + 1:
+                    self._raise_if_error()
+                    await asyncio.sleep(0.002)
+
+            # Never run the policy on a frozen observation.
+            now = time.monotonic()
+            state_age = now - self.session.state_timestamp
+            image_age = now - self.session.image_timestamp
+            if state_age > 0.25 or image_age > 0.5:
+                raise RuntimeError(f"stale observation: state {state_age*1e3:.0f} ms, "
+                                   f"images {image_age*1e3:.0f} ms old")
+
+            t_obs = self.session.state_timestamp
+            p_ref = tl.p_at(t_obs - self.obs_lag)        # where the measured joints are on the command axis
+            first_step = int(round(p_ref)) + 1           # actions[0] = the step after the observation
+            last_obs_step = tl.k_exec
+
+            t_infer_start = time.perf_counter()
+            resp = await self.request_policy_chunk(policy_ws)
+            infer_wall_ms = (time.perf_counter() - t_infer_start) * 1000.0
+
+            actions = np.asarray(resp["actions"], dtype=np.float32)
+            if actions.ndim != 2 or actions.shape[1] != 8:
+                raise ValueError(f"Expected actions shape (N, 8), got {actions.shape}")
+            horizon = self.replan_steps if self.exec_mode == "sync" else actions.shape[0]
+            k_at_merge = tl.k_exec
+            stats = tl.merge(actions, first_step, horizon)
+            latency = time.monotonic() - t_obs
+            self._latency_ema = latency if self._latency_ema is None else 0.8 * self._latency_ema + 0.2 * latency
+
+            safety_info = resp.get("safety_info", {})
+            timing_ms = resp.get("timing_ms", {})
+            server_timing = resp.get("server_timing", {})
+            logger.info(
+                "[Decision %d] %s | chunk@step %d, exec step %d: dropped=%d blended=%d used=%d seam=%.4f rad"
+                " | latency=%.0fms (ema %.0f) settle=%.0fms track_err=%.4f | underruns=%d overruns=%d",
+                decision_idx, self.exec_mode, first_step, k_at_merge, stats["dropped"], stats["blended"],
+                stats["used"], stats["seam"], latency * 1e3, self._latency_ema * 1e3, settle_ms, track_err,
+                self.n_underruns, self.n_overruns,
+            )
+            logger.info(
+                "[Decision %d] actions=%s | mode=%s changed=%s max_dq=%s | "
+                "policy=%.1fms corr=%.1fms infer=%.1fms (wall=%.1fms)",
+                decision_idx, actions.shape, safety_info.get("mode"), safety_info.get("changed"),
+                safety_info.get("max_dq_rad"), timing_ms.get("policy", 0.0), timing_ms.get("correction", 0.0),
+                server_timing.get("infer_ms", 0.0), infer_wall_ms,
+            )
+            decision_idx += 1
 
     # ------------------------------------------------------------------
     # Main Trial Session Loop
@@ -720,62 +888,19 @@ class RobotPolicyBridge:
                         self.start_move_duration,
                     )
 
-                # Step 2: Policy inference & execution loop
-                decision_idx = 0
-                while True:
-                    if self.session.error_event.is_set():
-                        raise RuntimeError(f"Stopping trial due to robot error: {self.session.error}")
-                    if 0 < self.max_decisions <= decision_idx:
-                        logger.info("Reached max_decisions=%d. Finishing trial.", self.max_decisions)
-                        break
-
-                    # Let the robot catch up with the last target so the observation matches the command
-                    # the next chunk will start from (see wait_settled).
-                    t_settle = time.perf_counter()
-                    track_err = await self.wait_settled(self.settle_tol, self.settle_timeout)
-                    settle_ms = (time.perf_counter() - t_settle) * 1000.0
-
-                    # Never run the policy on a frozen observation.
-                    now = time.monotonic()
-                    state_age = now - self.session.state_timestamp
-                    image_age = now - self.session.image_timestamp
-                    if state_age > 0.25 or image_age > 0.5:
-                        raise RuntimeError(f"stale observation: state {state_age*1e3:.0f} ms, "
-                                           f"images {image_age*1e3:.0f} ms old")
-
-                    # Targets pause while the policy runs; Robot Server holds the last target
-                    t_infer_start = time.perf_counter()
-                    resp = await self.request_policy_chunk(policy_ws)
-                    infer_wall_ms = (time.perf_counter() - t_infer_start) * 1000.0
-
-                    actions = np.asarray(resp["actions"], dtype=np.float32)
-                    if self.last_commanded_q is not None and actions.ndim == 2 and actions.shape[1] == 8:
-                        logger.info(
-                            "[Decision %d] settle=%.0fms track_err=%.4f rad | first action vs last target %.4f rad"
-                            " | 120Hz overruns so far=%d",
-                            decision_idx, settle_ms, track_err,
-                            float(np.max(np.abs(actions[0, :7] - self.last_commanded_q))), self.n_overruns,
-                        )
-                    safety_info = resp.get("safety_info", {})
-                    timing_ms = resp.get("timing_ms", {})
-                    server_timing = resp.get("server_timing", {})
-
-                    logger.info(
-                        "[Decision %d] actions=%s | mode=%s changed=%s max_dq=%s | "
-                        "policy=%.1fms corr=%.1fms infer=%.1fms (wall=%.1fms)",
-                        decision_idx,
-                        actions.shape,
-                        safety_info.get("mode"),
-                        safety_info.get("changed"),
-                        safety_info.get("max_dq_rad"),
-                        timing_ms.get("policy", 0.0),
-                        timing_ms.get("correction", 0.0),
-                        server_timing.get("infer_ms", 0.0),
-                        infer_wall_ms,
-                    )
-
-                    await self.execute_action_chunk(robot_ws, actions)
-                    decision_idx += 1
+                # Step 2: 120 Hz executor and policy queries run concurrently (see ActionTimeline)
+                logger.info("Execution: %s, replan every %d steps, blend %d steps, obs lag %.0f ms",
+                            self.exec_mode, self.replan_steps, self.timeline.blend_steps, self.obs_lag * 1e3)
+                exec_task = asyncio.create_task(self._executor_loop(robot_ws))
+                infer_task = asyncio.create_task(self._inference_loop(policy_ws))
+                try:
+                    done, _ = await asyncio.wait({exec_task, infer_task}, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        t.result()                       # re-raise a safety stop / robot error
+                finally:
+                    for t in (exec_task, infer_task):
+                        t.cancel()
+                    await asyncio.gather(exec_task, infer_task, return_exceptions=True)
 
             except asyncio.CancelledError:
                 logger.info("Trial cancelled.")
@@ -847,6 +972,16 @@ def parse_args() -> argparse.Namespace:
                         help="before each policy query, wait until |q - last target| < this (rad)")
     parser.add_argument("--settle-timeout", type=float, default=0.4,
                         help="max wait (s) for --settle-tol before each policy query; 0 disables settling")
+    parser.add_argument("--exec-mode", choices=["async", "sync"], default="async",
+                        help="async: query the policy while the robot keeps moving (default); "
+                             "sync: stop, settle, query, play --replan-steps actions (openpi ActionChunkBroker)")
+    parser.add_argument("--replan-steps", type=int, default=8,
+                        help="actions played per chunk before the next policy query (openpi action_horizon, default 8)")
+    parser.add_argument("--blend-steps", type=int, default=3,
+                        help="async: steps cross-faded from the old to the new chunk at each seam (0 = hard switch)")
+    parser.add_argument("--obs-lag", type=float, default=0.25,
+                        help="async: how far (s) the measured joints trail the commanded ones "
+                             "(Robot Server reference filter: 2/wn = 0.25 s for wn = 8)")
     parser.add_argument(
         "--crop-size",
         type=int,
@@ -934,6 +1069,10 @@ def main() -> None:
             max_dq=args.max_dq,
             settle_tol=args.settle_tol,
             settle_timeout=args.settle_timeout,
+            exec_mode=args.exec_mode,
+            replan_steps=args.replan_steps,
+            blend_steps=args.blend_steps,
+            obs_lag=args.obs_lag,
         )
         asyncio.run(bridge.run_trial())
     except KeyboardInterrupt:
